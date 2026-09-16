@@ -1,0 +1,168 @@
+#!/bin/sh
+export PATH=/bin:/sbin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t tmpfs tmpfs /tmp
+mount -t devtmpfs dev /dev 2>/dev/null || {
+  mkdir -p /dev
+  mknod /dev/mtd0 c 90 0
+  mknod /dev/console c 5 1
+  mknod /dev/null c 1 3
+}
+
+echo ""
+echo "======================================"
+echo "  THINGINO INSTALLER - Wyze Pan v4"
+echo "======================================"
+
+NOR=/dev/mtd0
+SDMNT=/tmp/sd
+BDIR=$SDMNT/wyze-backup-panv4
+FAIL=0
+
+echo ""
+echo "[1/6] Mounting SD card..."
+mkdir -p $SDMNT
+sleep 2
+mount -t vfat /dev/mmcblk0p1 $SDMNT
+if [ $? -ne 0 ]; then
+  echo "ERROR: cannot mount SD card"
+  sleep 30
+  reboot -f
+fi
+
+mkdir -p "$BDIR"
+
+echo ""
+echo "[2/6] Backing up NOR flash (16 MiB)..."
+
+echo "  Reading first copy..."
+dd if=$NOR of=$BDIR/full-backup.bin bs=4096 2>&1
+sync
+
+echo "  SHA256 first copy..."
+sha256sum $BDIR/full-backup.bin > $BDIR/full-backup.sha256
+cat $BDIR/full-backup.sha256
+
+echo "  Reading second copy for verification..."
+dd if=$NOR of=/tmp/verify.bin bs=4096 2>&1
+
+H1=$(sha256sum $BDIR/full-backup.bin | dd bs=64 count=1 2>/dev/null)
+H2=$(sha256sum /tmp/verify.bin | dd bs=64 count=1 2>/dev/null)
+if [ "$H1" != "$H2" ]; then
+  echo "ERROR: backup verification FAILED!"
+  echo "  Copy 1: $H1"
+  echo "  Copy 2: $H2"
+  echo "Aborting - NOR is untouched."
+  umount $SDMNT 2>/dev/null
+  sleep 30
+  reboot -f
+fi
+echo "  Backup verified OK"
+rm -f /tmp/verify.bin
+
+echo ""
+echo "[3/6] Backing up individual stock partitions..."
+echo "  mtdparts: 192K(uboot) 4544K(boot) 5632K(system) 5632K(back) 320K(cfg) 64K(provisioning)"
+
+PARTS="uboot:0:48 boot:48:1136 system:1184:1408 back:2592:1408 cfg:4000:80 provisioning:4080:16"
+
+for p in $PARTS; do
+  NAME=${p%%:*}; rest=${p#*:}; SKIP=${rest%%:*}; CNT=${rest#*:}
+  echo "  $NAME..."
+  dd if=$NOR of=$BDIR/$NAME.bin bs=4096 skip=$SKIP count=$CNT 2>/dev/null
+  dd if=$NOR of=/tmp/$NAME-v.bin bs=4096 skip=$SKIP count=$CNT 2>/dev/null
+  H_A=$(sha256sum $BDIR/$NAME.bin | dd bs=64 count=1 2>/dev/null)
+  H_B=$(sha256sum /tmp/$NAME-v.bin | dd bs=64 count=1 2>/dev/null)
+  if [ "$H_A" != "$H_B" ]; then
+    echo "  ERROR: $NAME verify FAILED!"
+    echo "    Copy 1: $H_A"
+    echo "    Copy 2: $H_B"
+    echo "  Aborting - NOR is untouched."
+    umount $SDMNT 2>/dev/null
+    sleep 30
+    reboot -f
+  fi
+  rm -f /tmp/$NAME-v.bin
+done
+
+sha256sum $BDIR/uboot.bin $BDIR/boot.bin $BDIR/system.bin $BDIR/back.bin $BDIR/cfg.bin $BDIR/provisioning.bin > $BDIR/partitions.sha256
+cat $BDIR/partitions.sha256
+
+echo ""
+echo "[4/6] Verifying partition split against full backup..."
+cat $BDIR/uboot.bin $BDIR/boot.bin $BDIR/system.bin $BDIR/back.bin $BDIR/cfg.bin $BDIR/provisioning.bin > /tmp/reassembled.bin
+H3=$(sha256sum /tmp/reassembled.bin | dd bs=64 count=1 2>/dev/null)
+if [ "$H1" != "$H3" ]; then
+  echo "ERROR: reassembly mismatch! Aborting."
+  umount $SDMNT 2>/dev/null
+  sleep 30
+  reboot -f
+fi
+echo "  Reassembly verified OK"
+rm -f /tmp/reassembled.bin
+sync
+
+echo ""
+echo "[5/6] Installing thingino..."
+
+echo "  Erasing flash..."
+flash_eraseall $NOR 2>&1
+
+echo "  Writing U-Boot (0x0)..."
+dd if=/uboot.bin of=$NOR bs=256 2>&1
+
+echo "  Writing env (0x50000)..."
+dd if=/uboot-env.bin of=$NOR bs=256 seek=1280 2>&1
+sync
+
+echo ""
+echo "[6/6] Verifying install..."
+
+UBOOT_SZ=$(wc -c < /uboot.bin)
+dd if=$NOR of=/tmp/uboot-rb.bin bs=1 count=$UBOOT_SZ 2>/dev/null
+H4=$(sha256sum /tmp/uboot-rb.bin | dd bs=64 count=1 2>/dev/null)
+H5=$(sha256sum /uboot.bin | dd bs=64 count=1 2>/dev/null)
+if [ "$H4" != "$H5" ]; then
+  echo "  WARNING: U-Boot verify failed!"
+  FAIL=1
+else
+  echo "  U-Boot verified OK"
+fi
+
+dd if=$NOR of=/tmp/env-rb.bin bs=256 skip=1280 count=256 2>/dev/null
+H6=$(sha256sum /tmp/env-rb.bin | dd bs=64 count=1 2>/dev/null)
+H7=$(sha256sum /uboot-env.bin | dd bs=64 count=1 2>/dev/null)
+if [ "$H6" != "$H7" ]; then
+  echo "  WARNING: env verify failed!"
+  FAIL=1
+else
+  echo "  Env verified OK"
+fi
+
+umount $SDMNT 2>/dev/null
+
+echo ""
+if [ "$FAIL" = "1" ]; then
+  echo "======================================"
+  echo "  INSTALL COMPLETED WITH WARNINGS"
+  echo "======================================"
+else
+  echo "======================================"
+  echo "  INSTALLATION COMPLETE"
+  echo "======================================"
+fi
+
+echo ""
+echo "Stock backup on SD: wyze-backup-panv4/"
+echo "  full-backup.bin    16 MiB  complete NOR dump"
+echo "  uboot.bin         192 KiB  stock SPL + U-Boot"
+echo "  boot.bin          4.4 MiB  stock FIT (kernel+ramdisk+dtb)"
+echo "  system.bin        5.5 MiB  stock system partition"
+echo "  back.bin          5.5 MiB  stock backup partition"
+echo "  cfg.bin           320 KiB  stock config (JFFS2)"
+echo "  provisioning.bin   64 KiB  stock provisioning"
+
+sleep 3
+reboot -f
+sleep 30
